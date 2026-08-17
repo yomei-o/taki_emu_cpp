@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Taki OS - 滝 / 水の流れを線で描く (C++/WASM)</title>
+<style>
+  :root{ --fg:#8fd4e8; }
+  *{ box-sizing:border-box; }
+  body{ margin:0; background:#04070d; color:var(--fg); font-family:'Courier New',monospace;
+        min-height:100vh; display:flex; flex-direction:column; align-items:center; gap:12px; padding:16px; }
+  h1{ font-size:16px; margin:0; font-weight:700; }
+  .sub{ font-size:12px; color:#5f8ea3; max-width:960px; text-align:center; line-height:1.6; }
+  canvas{ width:min(96vw,960px); height:auto; image-rendering:auto; background:#04070d;
+          border:1px solid #24404e; border-radius:6px; box-shadow:0 6px 26px #000a; cursor:crosshair; }
+  #panel{ display:flex; flex-wrap:wrap; gap:14px; align-items:center; justify-content:center; max-width:960px; }
+  .ctl{ display:flex; flex-direction:column; font-size:11px; color:#5f8ea3; min-width:150px; }
+  .ctl b{ color:var(--fg); }
+  input[type=range]{ accent-color:var(--fg); }
+  select{ font-family:inherit; font-size:12px; margin-top:3px; padding:4px 6px; border-radius:5px;
+          background:#0a1720; color:var(--fg); border:1px solid #2c5468; }
+  button{ font-family:inherit; font-size:13px; padding:7px 13px; border:1px solid #2c5468; border-radius:6px;
+          background:#0a1720; color:var(--fg); cursor:pointer; transition:background .12s, box-shadow .12s;
+          min-width:168px; }
+  button:hover{ background:#12252f; }
+  button:active{ transform:translateY(1px); }
+  button.on{ background:#134055; color:#d3f2ff; border-color:#8fd4e8; box-shadow:0 0 10px #8fd4e830; }
+  #status{ font-size:12px; color:#5f8ea3; font-variant-numeric:tabular-nums; min-height:1.2em; text-align:center; }
+  a{ color:var(--fg); }
+  body.fs{ padding:0; background:#000; gap:0; }
+  body.fs h1, body.fs .sub, body.fs #panel, body.fs #status{ display:none; }
+  body.fs canvas{ position:fixed; inset:0; width:100vw; height:100vh; max-width:none;
+                  object-fit:contain; border:none; border-radius:0; box-shadow:none;
+                  background:#000; cursor:none; }
+</style>
+</head>
+<body>
+  <h1>滝シミュレータ — 水の流れを線で描く <span style="color:#5f8ea3;font-size:12px">(C++ / WASM)</span></h1>
+  <p class="sub">
+    水を<b>粒子</b>として解いて、粒子が動いた軌跡をそのまま<b>線</b>として焼き付けています。
+    滝の絵を描いているのではなく、<b>水が岩を落ちた結果として線が引かれる</b>。<br>
+    岩は高さ場 H(x,z)。落ち口の直下を一気に落として壁にし、面には<b>溝</b>を彫ってあります。
+    <b>筋は描いていません</b> — 水が自分で溝に集まって筋になります。
+    粒子だけだと砂になるので、格子に密度を撒いて <b>p = K·max(0, ρ−ρ₀)</b> の勾配で押し返し、
+    速度を近傍平均へ寄せて粘性にしています。<br>
+    <b>着水速度は積分の結果</b>です。粒子ごとに「今回いちばん高かった所」からの落差 h を覚えていて、
+    ぶつかった瞬間の速さと <b>√(2gh)</b> を下に並べて出しています。表から読んだ値ではありません。<br>
+    クリックでその場所の水を跳ね上げます。<b>⛶ フルスクリーン</b>（または F キー）で線だけの全画面に。
+  </p>
+  <canvas id="cv"></canvas>
+  <div id="panel"></div>
+  <div id="status">読み込み中…</div>
+  <p class="sub">ソース: <a href="https://github.com/yomei-o/taki_emu_cpp">github.com/yomei-o/taki_emu_cpp</a></p>
+
+<script src="sim.js"></script>
+<script>
+"use strict";
+const CONFIG = {
+  sliders: [
+    { id:0, label:"水の量",             min:0.15, max:2.0,  step:0.05, val:1.0,  dec:2 },
+    { id:1, label:"流量",               min:0.3,  max:2.5,  step:0.05, val:1.0,  dec:2 },
+    { id:11,label:"水の広がり",         min:0.35, max:1.35, step:0.05, val:1.0,  dec:2 },
+    { id:2, label:"重力 [m/s²]",        min:1.0,  max:20.0, step:0.1,  val:9.81, dec:2 },
+    { id:3, label:"粘り",               min:0.0,  max:0.9,  step:0.02, val:0.35, dec:2 },
+    { id:4, label:"岩の摩擦",           min:0.0,  max:1.0,  step:0.02, val:0.32, dec:2 },
+    { id:10,label:"しぶき",             min:0.0,  max:2.5,  step:0.05, val:1.0,  dec:2 },
+    { id:5, label:"線の残り（尾の長さ）", min:0.55, max:0.965,step:0.005,val:0.83, dec:3 },
+    { id:6, label:"線の明るさ",          min:0.15, max:2.5,  step:0.05, val:0.85, dec:2 },
+    { id:7, label:"視点の向き [°]",      min:-75,  max:75,   step:1,    val:3,    dec:0 },
+    { id:8, label:"視点の高さ [°]",      min:2,    max:55,   step:1,    val:18,   dec:0 },
+    { id:12,label:"視点の距離 [m]",      min:22,   max:75,   step:1,    val:40,   dec:0 },
+  ],
+  clickable: true,
+};
+const ROCKS = ["一枚の滝","段瀑（二段）","分岐（三筋）","樋（一本の太い流れ）","岩場"];
+const COLORS = ["白青","藍","玉虫"];
+
+const $=id=>document.getElementById(id);
+const cv=$("cv"), ctx=cv.getContext("2d"), panel=$("panel"), statusEl=$("status");
+let M=null, api={}, W=0, H=0, img=null, playing=true, lastT=0, fpsAvg=0;
+let btnRock=null, btnColor=null, btnOrbit=null, btnReset=null, selRock=null;
+
+createSim().then(mod=>{
+  M=mod;
+  api.init  =M.cwrap("sim_init","number",["number","number"]);
+  api.w     =M.cwrap("sim_w","number",[]);
+  api.h     =M.cwrap("sim_h","number",[]);
+  api.reset =M.cwrap("sim_reset",null,[]);
+  api.step  =M.cwrap("sim_step",null,["number"]);
+  api.render=M.cwrap("sim_render","number",[]);
+  api.click =M.cwrap("sim_click",null,["number","number"]);
+  api.set   =M.cwrap("sim_set",null,["number","number"]);
+  api.action=M.cwrap("sim_action",null,["number"]);
+  api.get   =M.cwrap("sim_get","number",["number"]);
+  api.init(0,0);
+  W=api.w(); H=api.h(); cv.width=W; cv.height=H; img=ctx.createImageData(W,H);
+  buildPanel();
+  CONFIG.sliders.forEach(s=>api.set(s.id, s.val));
+  requestAnimationFrame(loop);
+});
+
+function setText(b,t){ if(b&&b.textContent!==t) b.textContent=t; }
+
+function buildPanel(){
+  CONFIG.sliders.forEach(s=>{
+    const wrap=document.createElement("label"); wrap.className="ctl";
+    const head=document.createElement("span");
+    const val=document.createElement("b"); val.textContent=Number(s.val).toFixed(s.dec);
+    head.textContent=s.label+" ";
+    head.appendChild(val);
+    const r=document.createElement("input");
+    r.type="range"; r.min=s.min; r.max=s.max; r.step=s.step; r.value=s.val;
+    r.addEventListener("input",()=>{ const v=parseFloat(r.value);
+      val.textContent=v.toFixed(s.dec); if(M) api.set(s.id, v); });
+    wrap.appendChild(head); wrap.appendChild(r); panel.appendChild(wrap);
+  });
+  // 岩の形
+  const rw=document.createElement("label"); rw.className="ctl"; rw.style.minWidth="200px";
+  const rh=document.createElement("span"); rh.textContent="岩の形";
+  selRock=document.createElement("select");
+  ROCKS.forEach((t,i)=>{ const o=document.createElement("option"); o.value=i; o.textContent=t; selRock.appendChild(o); });
+  selRock.value=2;
+  selRock.addEventListener("change",()=>{ if(M) api.set(9, parseInt(selRock.value,10)); });
+  rw.appendChild(rh); rw.appendChild(selRock); panel.appendChild(rw);
+
+  const mk=(txt,fn)=>{ const b=document.createElement("button"); b.textContent=txt;
+    b.addEventListener("click",()=>{ if(M) fn(); }); panel.appendChild(b); return b; };
+  btnRock  = mk("岩を見せる",       ()=>api.action(1));
+  btnColor = mk("色",               ()=>api.action(2));
+  btnOrbit = mk("視点をゆっくり回す",()=>api.action(3));
+  btnReset = mk("↺ リセット",       ()=>api.action(0));
+  mk("⛶ フルスクリーン (F)", toggleFullscreen);
+}
+
+function syncButtons(){
+  if(!M) return;
+  const rk=api.get(6)>0.5, cl=api.get(7)|0, ob=api.get(8)>0.5;
+  setText(btnRock, rk ? "岩: 見せる" : "岩: 隠す");   btnRock.classList.toggle("on", rk);
+  setText(btnColor, "色: "+COLORS[cl]);
+  setText(btnOrbit, ob ? "視点: 回転中" : "視点: 固定"); btnOrbit.classList.toggle("on", ob);
+}
+
+function blit(){ const p=api.render(); img.data.set(M.HEAPU8.subarray(p,p+W*H*4)); ctx.putImageData(img,0,0); }
+
+let lag=0;
+function loop(ts){
+  if(!playing) return;
+  if(lastT){ lag += Math.min(120, ts-lastT); const f=1000/(ts-lastT); fpsAvg = fpsAvg? fpsAvg*0.9+f*0.1 : f; }
+  lastT=ts;
+  let n = Math.max(1, Math.min(2, Math.round(lag/16.667)));
+  lag = Math.max(0, lag - n*16.667);
+  api.step(n); blit();
+  syncButtons();
+  const h=api.get(3), v=api.get(4), th=api.get(5);
+  setText(statusEl,
+    `${fpsAvg.toFixed(0)} fps (x${n})   水 ${(api.get(0)|0).toLocaleString()} 粒   ` +
+    `線 ${(api.get(1)|0).toLocaleString()} px/frame   最大 ${api.get(2).toFixed(1)} m/s   ` +
+    `｜ 実測 落差 ${h.toFixed(1)} m → 着水 ${v.toFixed(1)} m/s　（√(2gh) = ${th.toFixed(1)} m/s）`);
+  requestAnimationFrame(loop);
+}
+
+function applyFs(on){ document.body.classList.toggle("fs", on); if(M) api.set(13, on?0:1); }
+function toggleFullscreen(){
+  if(document.fullscreenElement) document.exitFullscreen();
+  else (document.documentElement.requestFullscreen?.() || Promise.reject()).catch(()=>applyFs(!document.body.classList.contains("fs")));
+}
+document.addEventListener("fullscreenchange",()=>applyFs(!!document.fullscreenElement));
+window.addEventListener("keydown",e=>{
+  if(e.key==="f"||e.key==="F") toggleFullscreen();
+  else if(e.key==="Escape"&&!document.fullscreenElement) applyFs(false);
+});
+
+if(CONFIG.clickable){
+  const emit=e=>{ const r=cv.getBoundingClientRect();
+    api.click((e.clientX-r.left)/r.width, (e.clientY-r.top)/r.height); };
+  cv.addEventListener("pointerdown",e=>{ if(M)emit(e); });
+}
+</script>
+</body>
+</html>
