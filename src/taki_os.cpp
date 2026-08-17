@@ -27,6 +27,7 @@
 #include <cstring>
 #include <chrono>
 #include <algorithm>
+#include <cstdlib>
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
 #define KEEP EMSCRIPTEN_KEEPALIVE
@@ -36,7 +37,7 @@
 
 // ---------------------------------------------------------------- 画面と時間
 static const int FW = 960, FH = 600;
-static const int SUBSTEPS = 3;
+static const int SUBSTEPS = 2;
 static const float DT = 1.0f / (60.0f * SUBSTEPS);
 
 // ---------------------------------------------------------------- 世界の寸法 [m]
@@ -177,6 +178,7 @@ struct Drop {
     float age;
     float pool;          // 滝壺に居た時間
     float ytop;          // 今回の落下の開始高さ（落差の実測用）
+    float v0;            // 今回の落下の初速（岩を離れた瞬間の速さ）
     uint8_t on;          // 画面座標が有効か
 };
 static std::vector<Drop> drops;
@@ -267,6 +269,8 @@ static float simTime = 0;
 static float measDrop = 0;       // 落差 [m]
 static float measImpact = 0;     // 着水速度 [m/s]（移動平均）
 static float measVmax = 0;
+static float measV0sq = 0;    // 落下の初速の二乗（平均）
+static float accV = 0, accH = 0, accQ = 0, accN = 0;   // 粒子で重み付けした累積
 static long  segCount = 0;
 static float dbgMaxDen=0, dbgMeanDen=0, dbgMaxX=0, dbgMaxY=0; static int dbgCells=0, dbgWide=0, dbgHigh=0;
 
@@ -352,6 +356,7 @@ static void spawn(Drop& d) {
     d.age = 0.0f;
     d.pool = 0.0f;
     d.ytop = d.y;
+    d.v0 = 0.0f;
     d.on = 0;
 }
 
@@ -364,7 +369,7 @@ static void scatter(Drop& d) {
     float h, gx, gz; terrain(d.x, d.z, h, gx, gz);
     d.y = h + 0.08f + rnd() * (d.z < BASE_Z ? 1.4f : 0.3f);
     d.vz = -2.0f * p_flow;
-    d.ytop = d.y; d.age = rnd() * 4.0f; d.pool = (d.z < BASE_Z) ? rnd() * 0.9f : 0.0f;
+    d.ytop = d.y; d.v0 = 0.0f; d.age = rnd() * 4.0f; d.pool = (d.z < BASE_Z) ? rnd() * 0.9f : 0.0f;
 }
 
 static size_t target_count() {
@@ -408,9 +413,9 @@ static void substep() {
     // --- 圧力と平均速度 ---
     // ★ 水が居られる体積はだいたい 500 セルぶん。REST（押し返しが始まる密度）は
     //   粒子数から決めないといけない。固定値にすると粒子を増やしただけで爆発する。
-    const float REST = clampf((float)N / 780.0f, 3.0f, 4000.0f);
+    const float REST = clampf((float)N / 700.0f, 3.0f, 4000.0f);
     const float KP = 110.0f / REST;          // KP·REST を一定に＝水の固さを一定に保つ
-    const float AMAX = 55.0f;               // 圧力加速度の頭打ち（保険）
+    const float AMAX = 26.0f;               // 圧力加速度の頭打ち（保険）
     for (size_t q = 0; q < gDen.size(); ++q) {
         float rho = gDen[q];
         if (rho > 0) { float inv = 1.0f / rho; gVx[q] *= inv; gVy[q] *= inv; gVz[q] *= inv; }
@@ -420,9 +425,16 @@ static void substep() {
     const float g = p_grav;
     const float visc = clampf(p_visc, 0, 1) * 0.55f;
     const float fric = clampf(p_fric, 0, 1) * 7.0f;
-    float vmax = 0, impSum = 0, dropSum = 0; int impN = 0;
+    float vmax = 0, impSum = 0, dropSum = 0, v0Sum = 0; int impN = 0;
     for (size_t p = 0; p < N; ++p) {
         Drop& d = drops[p];
+        // ★ 空中の水と岩の上の水を分ける。
+        //   圧力は空中では弱める（掛けたままだと落下中の水が重力以上に加速されて
+        //   着水速度が √(v0²+2gh) を超える。実測で 22.1 対 15.9 まで開いた）。
+        //   粘性はそのまま残す ── これは水の凝集であってエネルギーを増やさないし、
+        //   これが無いと落ちる水が束にならず霧のように散る。
+        float h0, gx0, gz0; terrain(d.x, d.z, h0, gx0, gz0);
+        float pScale = ((d.y - h0) < 1.2f) ? 1.0f : 0.22f;
         int i = (int)((d.x + XR) / CELL), j = (int)(d.y / CELL), k = (int)(d.z / CELL);
         if (i > 0 && j > 0 && k > 0 && i < GX - 1 && j < GY - 1 && k < GZ - 1) {
             float px_ = (gP[gidx(i + 1, j, k)] - gP[gidx(i - 1, j, k)]) / (2 * CELL);
@@ -430,7 +442,7 @@ static void substep() {
             float pz_ = (gP[gidx(i, j, k + 1)] - gP[gidx(i, j, k - 1)]) / (2 * CELL);
             float am = sqrtf(px_ * px_ + py_ * py_ + pz_ * pz_);
             if (am > AMAX) { float s2 = AMAX / am; px_ *= s2; py_ *= s2; pz_ *= s2; }
-            d.vx -= px_ * DT; d.vy -= py_ * DT; d.vz -= pz_ * DT;
+            d.vx -= px_ * DT * pScale; d.vy -= py_ * DT * pScale; d.vz -= pz_ * DT * pScale;
             int q = gidx(i, j, k);
             if (gDen[q] > 1.5f) {                       // 近所と速度を揃える＝粘性
                 d.vx += (gVx[q] - d.vx) * visc;
@@ -446,7 +458,7 @@ static void substep() {
         if (d.y < h) {
             d.y = h;
             // 勾配は頭打ちにする。壁のように急な面でも法線が寝すぎないように。
-            const float GMAX = 5.0f;
+            const float GMAX = 12.0f;
             float gm = sqrtf(gx * gx + gz * gz);
             if (gm > GMAX) { float s2 = GMAX / gm; gx *= s2; gz *= s2; }
             float nx = -gx, ny = 1.0f, nz = -gz;
@@ -454,24 +466,33 @@ static void substep() {
             nx *= inv; ny *= inv; nz *= inv;
             float vn = d.vx * nx + d.vy * ny + d.vz * nz;
             if (vn < 0) {
+                // ★ 計測は反射の【前】に取る。反射すると法線成分が消えるので、
+                //   後で測ると当たった速さではなく滑る速さになる（これで 8.2 m/s に見えていた）
+                {
+                    float hh = d.ytop - d.y;
+                    // 落ち口の高さから落ちてきて、まだ落下中のものだけ数える
+                    // （滝壺から圧力で打ち上げられた水を混ぜると v が過大に出る）
+                    if (-vn > 0.5f && hh > 4.0f && d.vy < 0.0f &&
+                        d.ytop > TOP_H - 3.5f && d.ytop < TOP_H + 1.5f) {
+                        impSum += sqrtf(d.vx * d.vx + d.vy * d.vy + d.vz * d.vz);
+                        dropSum += hh; v0Sum += d.v0 * d.v0; impN++;
+                    }
+                }
                 d.vx -= nx * vn; d.vy -= ny * vn; d.vz -= nz * vn;
                 float imp = -vn;
                 if (imp > 3.0f) {
                     d.foam = clampf(d.foam + imp * 0.09f, 0.0f, 1.6f);
                     float s = p_spray * clampf(imp * 0.020f, 0.0f, 0.55f);
                     d.vx += rnds() * s * 2.4f; d.vy += rnd() * s * 2.6f; d.vz += rnds() * s * 2.4f;
-                    // ★ 落差は粒子ごとに実測する（地形から引いた見込みではなく）。
-                    //   「今回いちばん高かった所」から「ぶつかった所」までが、その粒子の落差 h。
-                    //   速さ |v| と h を対にして貯めれば、v と √(2gh) を直接比べられる。
-                    float hh = d.ytop - d.y;
-                    if (hh > 4.0f) {
-                        impSum += sqrtf(d.vx * d.vx + d.vy * d.vy + d.vz * d.vz);
-                        dropSum += hh; impN++;
-                    }
                 }
             }
             float k2 = 1.0f - fric * DT; if (k2 < 0) k2 = 0;
             d.vx *= k2; d.vz *= k2;
+            // ★ 岩に触れたら落下の起点を引き直す。高さだけでなく【初速も】覚える。
+            //   壁を滑ってから離れた水は v0 を持って落ちるので、比べる相手は
+            //   √(2gh) ではなく √(v0² + 2gh)。ここを取り違えると 27% ずれる。
+            d.ytop = d.y;
+            d.v0 = sqrtf(d.vx * d.vx + d.vy * d.vy + d.vz * d.vz);
         }
         if (d.y > d.ytop) d.ytop = d.y;
         d.foam *= (1.0f - 1.7f * DT);
@@ -496,10 +517,15 @@ static void substep() {
         if(fabsf(d.x)>mx) mx=fabsf(d.x); if(d.y>my) my=d.y;
         if(fabsf(d.x)>13.0f) wide++; if(d.y>16.5f) high++; }
       dbgMaxX=mx; dbgMaxY=my; dbgWide=wide; dbgHigh=high; }
-    if (impN) {
-        float v = impSum / impN, h = dropSum / impN;
-        measImpact = measImpact > 0 ? measImpact * 0.985f + v * 0.015f : v;
-        measDrop   = measDrop   > 0 ? measDrop   * 0.985f + h * 0.015f : h;
+    // ★ 平均は【粒子で重み付け】する。
+    //   サブステップごとに平均してから EMA を掛けると、当たった粒子が1個しかない
+    //   サブステップも同じ重みになり、速い外れ値が効きすぎる（24.2 対 19.4 に開いた）。
+    //   和と個数を同じ係数で減衰させて、その比を取るのが正しい。
+    {
+        const float K = 0.9985f;
+        accV *= K; accH *= K; accQ *= K; accN *= K;
+        accV += impSum; accH += dropSum; accQ += v0Sum; accN += (float)impN;
+        if (accN > 1.0f) { measImpact = accV / accN; measDrop = accH / accN; measV0sq = accQ / accN; }
     }
     simTime += DT;
 }
@@ -520,19 +546,28 @@ static void draw() {
             float sp = sqrtf(d.vx * d.vx + d.vy * d.vy + d.vz * d.vz);
             float t = clampf(sp / 17.0f, 0, 1);
             float f = clampf(d.foam, 0, 1);
-            float r, g, b;
-            if (p_color == 1) {                       // 藍
-                r = 0.10f + 0.55f * t; g = 0.20f + 0.62f * t; b = 0.52f + 0.46f * t;
-            } else if (p_color == 2) {                // 玉虫
-                float hgt = clampf(d.y / 16.0f, 0, 1);
-                r = 0.20f + 0.75f * t * (0.4f + 0.6f * hgt);
-                g = 0.34f + 0.60f * t;
-                b = 0.62f + 0.38f * (1.0f - hgt) * t + 0.2f * t;
+            float r, g, b, foamMix;
+            if (p_color == 1) {                       // 藍 — 最後まで白くしない
+                r = 0.04f + 0.26f * t * t;
+                g = 0.13f + 0.42f * t;
+                b = 0.42f + 0.58f * t;
+                foamMix = 0.35f;                      // 泡も青を残す
+            } else if (p_color == 2) {                // 玉虫 — 速さで色相が回る
+                float hgt = clampf((d.y - 1.0f) / 15.0f, 0, 1);
+                float ph = t * 2.6f + hgt * 1.5f;
+                r = 0.30f + 0.55f * (0.5f + 0.5f * sinf(ph));
+                g = 0.30f + 0.50f * (0.5f + 0.5f * sinf(ph + 2.094f));
+                b = 0.34f + 0.55f * (0.5f + 0.5f * sinf(ph + 4.189f));
+                foamMix = 0.45f;
             } else {                                   // 白青（既定）
-                r = 0.16f + 0.80f * t * t; g = 0.34f + 0.66f * t; b = 0.58f + 0.42f * t;
+                r = 0.16f + 0.84f * t * t;
+                g = 0.36f + 0.64f * t;
+                b = 0.60f + 0.40f * t;
+                foamMix = 1.0f;                       // 泡はまっ白に
             }
-            // 白泡は白く明るく
-            r += (1.0f - r) * f; g += (1.0f - g) * f; b += (1.0f - b) * f;
+            // 白泡。色モードによってどこまで白へ寄せるかを変える
+            float fw = f * foamMix;
+            r += (1.0f - r) * fw; g += (1.0f - g) * fw; b += (1.0f - b) * fw;
             float fade = clampf((1.15f - d.pool) * 3.4f, 0.0f, 1.0f);   // 回収直前をなじませる
             float att = bri * (1.0f + 1.3f * f) * fade * (34.0f / (dep + 14.0f));
             r *= att; g *= att; b *= att;
@@ -569,7 +604,8 @@ KEEP void sim_reset() {
     drops.assign(target_count(), Drop());
     for (auto& d : drops) scatter(d);
     // 落差＝落ち口の高さ − 滝壺の水面
-    measDrop = 0; measImpact = 0; measVmax = 0; simTime = 0;
+    measDrop = 0; measImpact = 0; measVmax = 0; measV0sq = 0;
+    accV = accH = accQ = accN = 0; simTime = 0;
 }
 
 KEEP int sim_init(int seed, int) {
@@ -641,7 +677,7 @@ KEEP double sim_get(int id) {
     case 2: return measVmax;
     case 3: return measDrop;
     case 4: return measImpact;
-    case 5: return sqrt(2.0 * p_grav * (measDrop > 0 ? measDrop : 0));   // √(2gh)
+    case 5: return sqrt(measV0sq + 2.0 * p_grav * (measDrop > 0 ? measDrop : 0));   // √(2gh)
     case 6: return p_showRock;
     case 7: return p_color;
     case 8: return p_orbit;
@@ -679,8 +715,8 @@ KEEP uint32_t* sim_render() {
     if (p_hud) {
         char buf[192];
         Olivec_Canvas oc = olivec_canvas(px.data(), FW, FH, FW);
-        snprintf(buf, sizeof buf, "TAKI  drops %zu  drop %.1fm  impact %.1f m/s  sqrt(2gh) %.1f",
-                 drops.size(), measDrop, measImpact, sqrt(2.0 * p_grav * measDrop));
+        snprintf(buf, sizeof buf, "TAKI  drops %zu  drop %.1fm  impact %.1f m/s  sqrt(v0^2+2gh) %.1f",
+                 drops.size(), measDrop, measImpact, sqrt(measV0sq + 2.0 * p_grav * measDrop));
         olivec_text(oc, buf, 14, 12, olivec_default_font, 2, rgb(150, 200, 235));
         snprintf(buf, sizeof buf, "vmax %.1f m/s   segments %ld", measVmax, segCount);
         olivec_text(oc, buf, 14, FH - 26, olivec_default_font, 2, rgb(90, 130, 165));
@@ -720,9 +756,9 @@ int main(int argc, char** argv) {
         rgbbuf[(size_t)i * 3 + 2] = (c >> 16) & 0xFF;
     }
     stbi_write_png(out, FW, FH, 3, rgbbuf.data(), FW * 3);
-    printf("%s  drops=%zu drop=%.2fm impact=%.2f sqrt(2gh)=%.2f vmax=%.2f seg=%ld\n"
+    printf("%s  drops=%zu drop=%.2fm impact=%.2f sqrt(v0^2+2gh)=%.2f vmax=%.2f seg=%ld\n"
            "     REST=%.1f maxDen=%.0f meanDen=%.1f wetCells=%d\n",
-           out, drops.size(), measDrop, measImpact, sqrt(2.0 * p_grav * measDrop), measVmax, segCount,
+           out, drops.size(), measDrop, measImpact, sqrt(measV0sq + 2.0 * p_grav * measDrop), measVmax, segCount,
            drops.size() / 780.0, dbgMaxDen, dbgMeanDen, dbgCells);
     printf("     maxX=%.1f (channel 13)  maxY=%.1f (lip 15.5)  |x|>13: %d  y>16.5: %d\n",
            dbgMaxX, dbgMaxY, dbgWide, dbgHigh);
